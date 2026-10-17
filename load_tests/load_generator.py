@@ -2,13 +2,13 @@ import asyncio
 import random
 import time
 import httpx
+import os
 
 # Ingestion Gateway endpoint URL
 GATEWAY_URL = "http://localhost:8000/api/v1/events"
 
-# Test configuration
-TOTAL_REQUESTS = 5000
-CONCURRENT_WORKERS = 20
+TOTAL_REQUESTS = int(os.getenv("TOTAL_REQUESTS", "50000"))
+CONCURRENT_WORKERS = int(os.getenv("CONCURRENCY", "200"))
 
 SERVICES = ["auth-service", "payment-service", "checkout-api", "inventory-db", "recommendation-engine"]
 EVENT_TYPES = ["user_login", "payment_processed", "checkout_failed", "db_query", "item_viewed"]
@@ -31,7 +31,7 @@ def generate_payload():
     return {
         "service_name": service,
         "event_type": event_type,
-        "environment": env,
+        "environment": [env],
         "payload": payload_msg,
         "latency_ms": latency
     }

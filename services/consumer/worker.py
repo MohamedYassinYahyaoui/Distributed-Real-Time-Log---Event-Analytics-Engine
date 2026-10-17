@@ -55,9 +55,9 @@ def _sync_insert(client, table: str, data: list, column_names: list):
     client.insert(table=table, data=data, column_names=column_names)
 
 
-async def flush_to_clickhouse(client, batch: List[Dict[str, Any]]):
+async def flush_to_clickhouse(client, batch: List[Dict[str, Any]]) -> bool:
     if not batch:
-        return
+        return True
 
     rows = []
     for event in batch:
@@ -95,6 +95,7 @@ async def flush_to_clickhouse(client, batch: List[Dict[str, Any]]):
             ['timestamp', 'service_name', 'event_type', 'environment', 'payload', 'latency_ms']
         )
         logging.info(f"Persisted micro-batch of {len(batch)} records to ClickHouse.")
+        return True
     except Exception as e:
         logging.error(f"Failed to insert batch into ClickHouse: {e}")
         try:
@@ -107,13 +108,15 @@ async def flush_to_clickhouse(client, batch: List[Dict[str, Any]]):
                 ['raw_payload', 'error_message']
             )
             logging.warning(f"Routed {len(batch)} failed records to DLQ table.")
+            return True
         except Exception as dlq_err:
             logging.critical(f"DLQ insertion failed: {dlq_err}")
+            return False
 
 
-async def flush_to_dlq(client, invalid_batch: List[tuple[str, str]]):
+async def flush_to_dlq(client, invalid_batch: List[tuple[str, str]]) -> bool:
     if not invalid_batch:
-        return
+        return True
 
     try:
         await asyncio.to_thread(
@@ -124,8 +127,10 @@ async def flush_to_dlq(client, invalid_batch: List[tuple[str, str]]):
             ['raw_payload', 'error_message']
         )
         logging.warning(f"Routed {len(invalid_batch)} invalid records to DLQ.")
+        return True
     except Exception as err:
         logging.critical(f"DLQ insertion failed: {err}")
+        return False
 
 
 def parse_event(raw_value: bytes) -> tuple[Dict[str, Any] | None, str | None]:
@@ -148,6 +153,14 @@ def parse_event(raw_value: bytes) -> tuple[Dict[str, Any] | None, str | None]:
     return event, None
 
 
+async def commit_offsets(consumer: AIOKafkaConsumer):
+    """Commits current consumer offsets after batch persistence is confirmed."""
+    try:
+        await consumer.commit()
+    except Exception as e:
+        logging.error(f"Failed to commit offsets to broker: {e}")
+
+
 async def main():
     ch_client = clickhouse_connect.get_client(
         host=CLICKHOUSE_HOST,
@@ -165,7 +178,7 @@ async def main():
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id=KAFKA_GROUP_ID,
         auto_offset_reset='earliest',
-        enable_auto_commit=True,
+        enable_auto_commit=False,
     )
 
     retry_count = 0
@@ -220,23 +233,39 @@ async def main():
             current_time = asyncio.get_event_loop().time()
             time_elapsed = current_time - last_flush_time
 
-            if len(batch) >= BATCH_SIZE or (time_elapsed >= BATCH_TIMEOUT_SECONDS and len(batch) > 0):
-                await flush_to_clickhouse(ch_client, batch)
-                batch.clear()
-                last_flush_time = current_time
-            if len(invalid_batch) >= BATCH_SIZE or (time_elapsed >= BATCH_TIMEOUT_SECONDS and invalid_batch):
-                await flush_to_dlq(ch_client, invalid_batch)
-                invalid_batch.clear()
-                last_flush_time = current_time
+            should_flush = (
+                len(batch) >= BATCH_SIZE
+                or len(invalid_batch) >= BATCH_SIZE
+                or (time_elapsed >= BATCH_TIMEOUT_SECONDS and (len(batch) > 0 or len(invalid_batch) > 0))
+            )
+
+            if should_flush:
+                events_flushed = await flush_to_clickhouse(ch_client, batch)
+                if events_flushed:
+                    batch.clear()
+
+                dlq_flushed = await flush_to_dlq(ch_client, invalid_batch)
+                if dlq_flushed:
+                    invalid_batch.clear()
+
+                if events_flushed and dlq_flushed:
+                    await commit_offsets(consumer)
+                    last_flush_time = current_time
 
     finally:
+        events_flushed = True
+        dlq_flushed = True
         if batch:
             logging.info(f"Flushing remaining {len(batch)} items before shutdown...")
-            await flush_to_clickhouse(ch_client, batch)
-            batch.clear()
+            events_flushed = await flush_to_clickhouse(ch_client, batch)
+            if events_flushed:
+                batch.clear()
         if invalid_batch:
-            await flush_to_dlq(ch_client, invalid_batch)
-            invalid_batch.clear()
+            dlq_flushed = await flush_to_dlq(ch_client, invalid_batch)
+            if dlq_flushed:
+                invalid_batch.clear()
+        if events_flushed and dlq_flushed:
+            await commit_offsets(consumer)
         await consumer.stop()
         logging.info("Consumer shutdown complete.")
 
