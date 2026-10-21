@@ -18,10 +18,13 @@ producer: Optional[AIOKafkaProducer] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global producer
-    # Initialize non-blocking Kafka producer
+    
     producer = AIOKafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8")
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        linger_ms=5,
+        max_batch_size=65536,
+        acks=1,
     )
     
     # Retry connection logic for cluster initialization
@@ -68,7 +71,7 @@ async def ingest_event(event: LogEvent):
 
     try:
         # Asynchronously send message to Redpanda topic
-        await producer.send_and_wait(KAFKA_TOPIC, event_data)
+        await producer.send(KAFKA_TOPIC, event_data)
         return {"status": "queued", "topic": KAFKA_TOPIC}
     except Exception as e:
         raise HTTPException(

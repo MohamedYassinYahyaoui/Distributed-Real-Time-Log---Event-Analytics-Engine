@@ -21,7 +21,7 @@ CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
 CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "")
 
 # Micro-batching tuning thresholds
-BATCH_SIZE = 1000
+BATCH_SIZE = 10000
 BATCH_TIMEOUT_SECONDS = 1.0
 
 
