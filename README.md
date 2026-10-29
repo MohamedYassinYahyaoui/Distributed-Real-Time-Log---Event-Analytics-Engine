@@ -1,8 +1,12 @@
 # StreamPulse — Distributed Real-Time Telemetry & Log Ingestion Engine
 
+[![Watch Live Benchmark & Architecture Walkthrough on Loom](https://img.shields.io/badge/Loom_Video_Demo-Watch_10k%2B_Req%2FSec_Benchmark_(2%3A22)-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/1cc9c2674e0b4a73b64ff7489858df0d)
+
+> **🎥 [Watch the 2-Minute Live Architecture & 100,000-Event Load Test Walkthrough on Loom](https://www.loom.com/share/1cc9c2674e0b4a73b64ff7489858df0d)**
+
 Distributed, high-throughput event streaming and OLAP analytics platform built with **FastAPI**, **PostgreSQL 16 (Async SQLAlchemy 2.0)**, **Redis 7**, **Redpanda (Kafka)**, **ClickHouse**, and **Grafana**. Engineered for **10,000+ to 13,000+ events/sec** sustained ingestion with **multi-tenant SHA-256 API Key & HS256 JWT authentication**, **2-tier read-through Redis caching**, **atomic Redis rate limiting**, thread-offloaded columnar writes (`asyncio.to_thread`), strict **At-Least-Once** manual offset commits, and automated **Dead-Letter Queue (DLQ)** quarantine.
 
-![StreamPulse Pipeline Demo](assets/demo.gif)
+[![StreamPulse Pipeline Demo](assets/demo.gif)](https://www.loom.com/share/1cc9c2674e0b4a73b64ff7489858df0d)
 
 ---
 
