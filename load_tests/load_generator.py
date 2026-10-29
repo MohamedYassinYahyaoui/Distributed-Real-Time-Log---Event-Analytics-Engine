@@ -51,16 +51,27 @@ async def socket_worker(num_requests: int, frames: list[bytes]) -> dict:
     try:
         reader, writer = await asyncio.open_connection(HOST, PORT)
         for i in range(num_requests):
+            frame = frames[i % pool_len]
             try:
-                writer.write(frames[i % pool_len])
+                writer.write(frame)
                 data = await reader.read(1024)
+                if not data:
+                    # Keep-alive socket closed by server (EOF); reconnect transparently and retry frame
+                    writer.close()
+                    reader, writer = await asyncio.open_connection(HOST, PORT)
+                    writer.write(frame)
+                    data = await reader.read(1024)
+
                 if b"202 Accepted" in data:
                     results["success"] += 1
                 else:
                     results["failed"] += 1
             except Exception:
                 results["errors"] += 1
-                reader, writer = await asyncio.open_connection(HOST, PORT)
+                try:
+                    reader, writer = await asyncio.open_connection(HOST, PORT)
+                except Exception:
+                    pass
         writer.close()
     except Exception:
         results["errors"] += num_requests
