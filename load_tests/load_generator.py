@@ -5,8 +5,9 @@ import random
 import time
 from multiprocessing import Pool
 
-HOST = "127.0.0.1"
-PORT = 8000
+HOST = os.getenv("GATEWAY_HOST", "127.0.0.1")
+PORT = int(os.getenv("GATEWAY_PORT", "8000"))
+API_KEY = os.getenv("API_KEY", "sp_live_default_bench_key_2026")
 
 TOTAL_REQUESTS = int(os.getenv("TOTAL_REQUESTS", "100000"))
 NUM_PROCESSES = int(os.getenv("PROCESSES", "4"))
@@ -18,7 +19,7 @@ ENVIRONMENTS = ["production", "staging"]
 
 
 def build_http_frames(pool_size: int = 200) -> list[bytes]:
-    """Pre-builds raw HTTP/1.1 Keep-Alive POST frames so 0% CPU is wasted on client overhead."""
+    """Pre-builds raw HTTP/1.1 Keep-Alive POST frames (with X-API-Key auth) so 0% CPU is wasted on client overhead."""
     frames = []
     for _ in range(pool_size):
         latency = random.randint(8, 35) if random.random() < 0.90 else random.randint(45, 95)
@@ -34,6 +35,7 @@ def build_http_frames(pool_size: int = 200) -> list[bytes]:
         frame = (
             f"POST /api/v1/events HTTP/1.1\r\n"
             f"Host: {HOST}:{PORT}\r\n"
+            f"X-API-Key: {API_KEY}\r\n"
             f"Content-Type: application/json\r\n"
             f"Content-Length: {len(body)}\r\n"
             f"Connection: keep-alive\r\n\r\n"

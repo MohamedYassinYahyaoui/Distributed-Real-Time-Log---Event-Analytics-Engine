@@ -21,27 +21,28 @@ CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
 CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "")
 
 # Micro-batching tuning thresholds
-BATCH_SIZE = 10000
-BATCH_TIMEOUT_SECONDS = 1.0
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10000"))
+BATCH_TIMEOUT_SECONDS = float(os.getenv("BATCH_TIMEOUT_SECONDS", "1.0"))
 
 
 def init_clickhouse_tables(client):
     """Ensures primary tables and DLQ tables exist prior to batch processing."""
     client.command("""
     CREATE TABLE IF NOT EXISTS system_events (
-        timestamp DateTime64(3, 'UTC'),
-        service_name String,
-        event_type String,
-        environment String,
+        timestamp DateTime64(3, 'UTC') DEFAULT now64(3),
+        service_name LowCardinality(String),
+        event_type LowCardinality(String),
+        environment LowCardinality(String),
         payload String,
         latency_ms Int32
     ) ENGINE = MergeTree()
-    ORDER BY (timestamp, service_name, event_type);
+    PRIMARY KEY (service_name, event_type)
+    ORDER BY (service_name, event_type, timestamp);
     """)
 
     client.command("""
     CREATE TABLE IF NOT EXISTS system_events_dlq (
-        timestamp DateTime64(3, 'UTC') DEFAULT now(),
+        timestamp DateTime64(3, 'UTC') DEFAULT now64(3),
         raw_payload String,
         error_message String
     ) ENGINE = MergeTree()

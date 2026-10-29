@@ -1,7 +1,7 @@
 # Python / Virtual Environments
 __pycache__/
 pytest_cache/
-
+interview_prepare.md
 *.py[cod]
 *$py.class
 .venv/

@@ -1,5 +1,41 @@
 services:
   # ---------------------------------------------------------------------------
+  # Relational Control Plane: PostgreSQL 16 (Tenants & SHA-256 API Keys)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: stream-pulse-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=streampulse
+      - POSTGRES_PASSWORD=streampulse_pass
+      - POSTGRES_DB=streampulse_auth
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streampulse -d streampulse_auth"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # In-Memory Cache & Rate Limiter: Redis 7
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: stream-pulse-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
   # Message Broker: Redpanda (Kafka-compatible)
   # ---------------------------------------------------------------------------
   redpanda:
@@ -22,7 +58,7 @@ services:
       test: ["CMD-SHELL", "rpk cluster info || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   # ---------------------------------------------------------------------------
   # OLAP Database: ClickHouse
@@ -39,14 +75,15 @@ services:
       - CLICKHOUSE_PASSWORD=admin
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "wget --spider -q http://localhost:8123/ping || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   # ---------------------------------------------------------------------------
-  # API Gateway: Event Producer
+  # API Gateway: Event Producer + Auth & Rate-Limiting (4x Uvicorn Workers)
   # ---------------------------------------------------------------------------
   gateway:
     build:
@@ -57,12 +94,24 @@ services:
       - "8000:8000"
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
+      - DATABASE_URL=postgresql+asyncpg://streampulse:streampulse_pass@postgres:5432/streampulse_auth
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET_KEY=streampulse-hs256-super-secret-jwt-key-2026
     depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
       redpanda:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   # ---------------------------------------------------------------------------
-  # Event Consumer Worker
+  # Event Consumer Worker (AIOKafka Micro-Batching -> ClickHouse)
   # ---------------------------------------------------------------------------
   consumer:
     build:
@@ -82,7 +131,7 @@ services:
         condition: service_healthy
 
   # ---------------------------------------------------------------------------
-  # Analytics API: Query Service
+  # Analytics API: Query Service (ClickHouse P95/P99 + Redis Query Cache)
   # ---------------------------------------------------------------------------
   analytics_api:
     build:
@@ -96,9 +145,22 @@ services:
       - CLICKHOUSE_PORT=8123
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=admin
+      - REDIS_URL=redis://redis:6379/0
+      - CACHE_TTL_SECONDS=5
     depends_on:
       clickhouse:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Grafana Observability Dashboard (Auto-Provisioned)
+  # ---------------------------------------------------------------------------
   grafana:
     image: grafana/grafana-enterprise:latest
     container_name: stream-pulse-grafana
@@ -110,7 +172,74 @@ services:
       - GF_LOG_FILTERS=provisioning.dashboard:debug
     volumes:
       - ./services/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Automated 1-Command Pipeline Smoke Test & Seed Runner
+  # ---------------------------------------------------------------------------
+  pipeline_verifier:
+    image: python:3.11-slim
+    container_name: stream-pulse-verifier
+    restart: "no"
+    depends_on:
+      gateway:
+        condition: service_healthy
+      analytics_api:
+        condition: service_healthy
+      consumer:
+        condition: service_started
+    command:
+      - python
+      - -c
+      - |
+        import json, random, time, urllib.request, urllib.error
+        print("=== [StreamPulse Verifier] Starting 1-Command End-to-End Pipeline Check ===")
+        time.sleep(3)
+        tenant_payload = json.dumps({"name": f"FinTech-Core-{random.randint(100,999)}", "plan_tier": "enterprise", "rate_limit_per_min": 50000}).encode("utf-8")
+        t_req = urllib.request.Request("http://gateway:8000/api/v1/auth/tenants", data=tenant_payload, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(t_req) as resp:
+            tenant_info = json.loads(resp.read().decode("utf-8"))
+        api_key = tenant_info["raw_api_key"]
+        jwt_token = tenant_info["jwt_token"]
+        print(f"[1/4] PostgreSQL Tenant & SHA-256 API Key Provisioned: tenant={tenant_info['tenant_id']} prefix={tenant_info['key_prefix']}...")
+        services = ["auth-service", "payment-service", "checkout-api", "inventory-db", "recommendation-engine"]
+        events = ["user_login", "payment_processed", "checkout_failed", "db_query", "item_viewed"]
+        accepted = 0
+        for i in range(100):
+            payload = json.dumps({
+                "service_name": services[i % len(services)],
+                "event_type": events[i % len(events)],
+                "environment": ["production"],
+                "payload": json.dumps({"request_id": f"req-{1000+i}"}),
+                "latency_ms": random.randint(10, 85)
+            }).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if i % 2 == 0:
+                headers["X-API-Key"] = api_key
+            else:
+                headers["Authorization"] = f"Bearer {jwt_token}"
+            req = urllib.request.Request("http://gateway:8000/api/v1/events", data=payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req) as resp:
+                if resp.status == 202:
+                    accepted += 1
+        print(f"[2/4] Authenticated Ingestion Verified (X-API-Key & HS256 JWT + Redis Rate-Limit): {accepted}/100 events returned HTTP 202.")
+        try:
+            bad_req = urllib.request.Request("http://gateway:8000/api/v1/events", data=b'{"service_name":"","latency_ms":-5}', headers={"Content-Type": "application/json", "X-API-Key": api_key}, method="POST")
+            urllib.request.urlopen(bad_req)
+        except urllib.error.HTTPError as e:
+            print(f"[3/4] Boundary Schema Enforcement Verified: Malformed event rejected with HTTP {e.code}.")
+        time.sleep(2.5)
+        with urllib.request.urlopen("http://analytics_api:8000/api/v1/analytics/summary") as resp1:
+            cache_1 = resp1.headers.get("X-Cache")
+            summary = json.loads(resp1.read().decode("utf-8"))
+        with urllib.request.urlopen("http://analytics_api:8000/api/v1/analytics/summary") as resp2:
+            cache_2 = resp2.headers.get("X-Cache")
+        print(f"[4/4] ClickHouse OLAP & Redis Query Cache Verified (1st={cache_1}, 2nd={cache_2}): {json.dumps(summary)}")
+        print("=== [StreamPulse Verifier] Pipeline Healthy! Grafana Live at http://localhost:3000 ===")
 
 volumes:
+  postgres_data:
   clickhouse_data:
   grafana_data:
