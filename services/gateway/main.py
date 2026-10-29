@@ -6,7 +6,8 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field
 from aiokafka import AIOKafkaProducer
 from sqlalchemy import select
@@ -40,7 +41,6 @@ async def lifespan(app: FastAPI):
 
     producer = AIOKafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         linger_ms=5,
         max_batch_size=65536,
         acks=1,
@@ -230,28 +230,54 @@ async def revoke_api_key(key_id: str):
     return {"status": "revoked", "key_id": key_id}
 
 
+# Pre-allocated HTTP 202 response payload for zero-allocation hot path
+_QUEUED_RESP_BYTES = f'{{"status":"queued","topic":"{KAFKA_TOPIC}"}}'.encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # High-Throughput Telemetry Ingestion Endpoint
 # ---------------------------------------------------------------------------
-@app.post("/api/v1/events", status_code=status.HTTP_202_ACCEPTED, tags=["Ingestion"])
-async def ingest_event(
-    event: LogEvent,
-    auth_ctx: Dict[str, Any] = Depends(authenticate_and_ratelimit),
-):
+@app.post(
+    "/api/v1/events",
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["Ingestion"],
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/json": {"schema": LogEvent.model_json_schema()}},
+            "required": True,
+        }
+    },
+)
+async def ingest_event(request: Request):
     if not producer:
         raise HTTPException(status_code=500, detail="Event producer unavailable")
 
-    event_data = event.model_dump()
-    if not event_data.get("timestamp"):
-        event_data["timestamp"] = datetime.now(timezone.utc).isoformat()
+    # 1. Ultra-fast L1 hot-path auth & rate-limit check
+    raw_key = request.headers.get("x-api-key")
+    auth_header = request.headers.get("authorization")
+    await authenticate_and_ratelimit(x_api_key=raw_key, authorization=auth_header)
+
+    # 2. Single-pass Rust Pydantic v2 validation directly from raw HTTP bytes
+    raw_body = await request.body()
+    try:
+        event = LogEvent.model_validate_json(raw_body)
+    except Exception as val_err:
+        raise HTTPException(status_code=422, detail=str(val_err))
+
+    # 3. Zero-copy forward if timestamp is already present; otherwise serialize with UTC timestamp
+    if event.timestamp:
+        payload_bytes = raw_body
+    else:
+        event.timestamp = datetime.now(timezone.utc).isoformat()
+        payload_bytes = event.model_dump_json().encode("utf-8")
 
     try:
-        await producer.send(KAFKA_TOPIC, event_data)
-        return {
-            "status": "queued",
-            "topic": KAFKA_TOPIC,
-            "tenant_id": auth_ctx["tenant_id"],
-        }
+        await producer.send(KAFKA_TOPIC, payload_bytes)
+        return Response(
+            content=_QUEUED_RESP_BYTES,
+            status_code=202,
+            media_type="application/json",
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

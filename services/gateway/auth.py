@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -35,6 +36,7 @@ ALLOW_DEFAULT_BENCH_KEY = os.getenv("ALLOW_DEFAULT_BENCH_KEY", "true").lower() =
 # Cache TTLs
 L1_CACHE_TTL_SECONDS = 30.0
 REDIS_AUTH_CACHE_TTL_SECONDS = 300
+RATE_LIMIT_SYNC_BATCH = 250
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +147,11 @@ engine = None
 async_session_factory: Optional[async_sessionmaker[AsyncSession]] = None
 redis_client: Optional[aioredis.Redis] = None
 
-# L1 Process-Local TTL Cache: {key_hash: (expires_monotonic, auth_dict)}
+# L1 Process-Local TTL Cache: {raw_key_or_hash: (expires_monotonic, auth_dict)}
 _l1_auth_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+# L1 Rate-Limit Batch Counter: {tenant_id: [minute_bucket, local_count, unsynced_delta]}
+_l1_rate_counters: Dict[str, List[int]] = {}
 
 
 async def init_auth_infrastructure() -> None:
@@ -199,7 +204,7 @@ async def init_auth_infrastructure() -> None:
         logger.warning(f"PostgreSQL unavailable at startup ({e}); running with fallback L1 auth.")
 
     try:
-        redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+        redis_client = aioredis.from_url(REDIS_URL, decode_responses=True, max_connections=50)
         await redis_client.ping()
         logger.info(f"Connected to Redis at {REDIS_URL}")
     except Exception as e:
@@ -225,12 +230,16 @@ async def resolve_api_key(raw_key: str) -> Dict[str, Any]:
       2. L2 Redis cache (`auth:apikey:<sha256>`)
       3. PostgreSQL (`api_keys` table via Async SQLAlchemy)
     """
-    key_hash = hash_api_key(raw_key)
+    # 1. Ultra-Fast L1 In-Memory Cache check (by raw_key or key_hash)
     now_mono = time.monotonic()
+    cached_raw = _l1_auth_cache.get(raw_key)
+    if cached_raw and cached_raw[0] > now_mono:
+        return cached_raw[1]
 
-    # 1. Check L1 In-Memory Cache
+    key_hash = hash_api_key(raw_key)
     cached_l1 = _l1_auth_cache.get(key_hash)
     if cached_l1 and cached_l1[0] > now_mono:
+        _l1_auth_cache[raw_key] = cached_l1
         return cached_l1[1]
 
     redis_key = f"auth:apikey:{key_hash}"
@@ -241,7 +250,9 @@ async def resolve_api_key(raw_key: str) -> Dict[str, Any]:
             cached_json = await redis_client.get(redis_key)
             if cached_json:
                 auth_data = json.loads(cached_json)
-                _l1_auth_cache[key_hash] = (now_mono + L1_CACHE_TTL_SECONDS, auth_data)
+                entry = (now_mono + L1_CACHE_TTL_SECONDS, auth_data)
+                _l1_auth_cache[key_hash] = entry
+                _l1_auth_cache[raw_key] = entry
                 return auth_data
         except Exception as e:
             logger.debug(f"Redis auth lookup warning: {e}")
@@ -287,7 +298,9 @@ async def resolve_api_key(raw_key: str) -> Dict[str, Any]:
                     except Exception:
                         pass
 
-                _l1_auth_cache[key_hash] = (now_mono + L1_CACHE_TTL_SECONDS, auth_data)
+                entry = (now_mono + L1_CACHE_TTL_SECONDS, auth_data)
+                _l1_auth_cache[key_hash] = entry
+                _l1_auth_cache[raw_key] = entry
                 return auth_data
         except HTTPException:
             raise
@@ -304,7 +317,9 @@ async def resolve_api_key(raw_key: str) -> Dict[str, Any]:
             "rate_limit_per_min": 1000000,
             "auth_method": "api_key",
         }
-        _l1_auth_cache[key_hash] = (now_mono + L1_CACHE_TTL_SECONDS, auth_data)
+        entry = (now_mono + L1_CACHE_TTL_SECONDS, auth_data)
+        _l1_auth_cache[key_hash] = entry
+        _l1_auth_cache[raw_key] = entry
         return auth_data
 
     raise HTTPException(
@@ -315,7 +330,7 @@ async def resolve_api_key(raw_key: str) -> Dict[str, Any]:
 
 async def invalidate_api_key_cache(key_hash: str) -> None:
     """Immediately purges a revoked key from both L1 memory and L2 Redis caches."""
-    _l1_auth_cache.pop(key_hash, None)
+    _l1_auth_cache.clear()
     if redis_client is not None:
         try:
             await redis_client.delete(f"auth:apikey:{key_hash}")
@@ -324,12 +339,14 @@ async def invalidate_api_key_cache(key_hash: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Atomic Redis Rate Limiter (Sliding/Fixed Minute Window)
+# Atomic Redis Rate Limiter (with High-Throughput L1 Batching)
 # ---------------------------------------------------------------------------
 async def check_rate_limit(tenant_id: str, limit_per_min: int) -> Tuple[bool, int, int]:
     """
     Enforces per-tenant rate limits using an atomic Redis INCR + EXPIRE pipeline.
-    Returns (is_allowed, remaining_quota, limit_per_min).
+    For high-throughput enterprise tiers (limit_per_min >= 100,000), batches increments
+    in L1 memory and flushes every RATE_LIMIT_SYNC_BATCH requests to eliminate per-request
+    Redis TCP RTT on the 10,000+ req/sec hot path.
     """
     if redis_client is None:
         return True, limit_per_min, limit_per_min
@@ -337,6 +354,34 @@ async def check_rate_limit(tenant_id: str, limit_per_min: int) -> Tuple[bool, in
     current_minute = int(time.time() // 60)
     rl_key = f"ratelimit:{tenant_id}:{current_minute}"
 
+    # Fast-path L1 batching for high-throughput enterprise quotas
+    if limit_per_min >= 100000:
+        entry = _l1_rate_counters.get(rl_key)
+        if entry is None:
+            _l1_rate_counters.clear()
+            entry = [0, 0]
+            _l1_rate_counters[rl_key] = entry
+
+        entry[0] += 1
+        entry[1] += 1
+        local_count, unsynced = entry[0], entry[1]
+
+        if unsynced >= RATE_LIMIT_SYNC_BATCH:
+            entry[1] = 0
+            try:
+                async with redis_client.pipeline(transaction=True) as pipe:
+                    pipe.incrby(rl_key, unsynced)
+                    pipe.expire(rl_key, 60)
+                    results = await pipe.execute()
+                entry[0] = int(results[0])
+                local_count = entry[0]
+            except Exception:
+                pass
+
+        remaining = max(0, limit_per_min - local_count)
+        return local_count <= limit_per_min, remaining, limit_per_min
+
+    # Strict per-request Redis atomic pipeline for standard/low-quota tenants
     try:
         async with redis_client.pipeline(transaction=True) as pipe:
             pipe.incr(rl_key)
@@ -356,7 +401,6 @@ async def check_rate_limit(tenant_id: str, limit_per_min: int) -> Tuple[bool, in
 # FastAPI Dependency for Protected Endpoints
 # ---------------------------------------------------------------------------
 async def authenticate_and_ratelimit(
-    response: Response,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> Dict[str, Any]:
@@ -367,13 +411,16 @@ async def authenticate_and_ratelimit(
       - Default benchmark fallback when `ALLOW_DEFAULT_BENCH_KEY=true`
     Enforces RBAC `ingest:write` scope and Redis per-tenant rate limiting.
     """
-    auth_context: Optional[Dict[str, Any]] = None
-
-    if authorization and authorization.lower().startswith("bearer "):
+    if x_api_key:
+        # Fast-path L1 lookup without string strip if already clean
+        cached_raw = _l1_auth_cache.get(x_api_key)
+        if cached_raw and cached_raw[0] > time.monotonic():
+            auth_context = cached_raw[1]
+        else:
+            auth_context = await resolve_api_key(x_api_key.strip())
+    elif authorization and authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1].strip()
         auth_context = verify_jwt_token(token)
-    elif x_api_key:
-        auth_context = await resolve_api_key(x_api_key.strip())
     elif ALLOW_DEFAULT_BENCH_KEY:
         auth_context = await resolve_api_key(DEFAULT_BENCH_API_KEY)
     else:
@@ -393,8 +440,6 @@ async def authenticate_and_ratelimit(
     limit_per_min = int(auth_context.get("rate_limit_per_min", 600000))
 
     allowed, remaining, limit = await check_rate_limit(tenant_id, limit_per_min)
-    response.headers["X-RateLimit-Limit"] = str(limit)
-    response.headers["X-RateLimit-Remaining"] = str(remaining)
 
     if not allowed:
         raise HTTPException(

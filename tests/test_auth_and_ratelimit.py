@@ -108,11 +108,9 @@ def test_redis_atomic_rate_limiter_enforces_quota_and_429():
     )
 
     with patch.object(auth, "redis_client", mock_redis):
-        response = Response()
         with pytest.raises(HTTPException) as exc_info:
             asyncio.run(
                 auth.authenticate_and_ratelimit(
-                    response=response,
                     x_api_key=None,
                     authorization=f"Bearer {token}",
                 )

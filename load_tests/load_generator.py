@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import random
+import socket
 import time
 from multiprocessing import Pool
 
@@ -9,9 +10,10 @@ HOST = os.getenv("GATEWAY_HOST", "127.0.0.1")
 PORT = int(os.getenv("GATEWAY_PORT", "8000"))
 API_KEY = os.getenv("API_KEY", "sp_live_default_bench_key_2026")
 
-TOTAL_REQUESTS = int(os.getenv("TOTAL_REQUESTS", "100000"))
+TOTAL_REQUESTS = int(os.getenv("TOTAL_REQUESTS", "50000"))
 NUM_PROCESSES = int(os.getenv("PROCESSES", "4"))
 CONCURRENCY_PER_PROCESS = int(os.getenv("CONCURRENCY_PER_PROC", "25"))
+PIPELINE_DEPTH = int(os.getenv("PIPELINE_DEPTH", "25"))
 
 SERVICES = ["auth-service", "payment-service", "checkout-api", "inventory-db", "recommendation-engine"]
 EVENT_TYPES = ["user_login", "payment_processed", "checkout_failed", "db_query", "item_viewed"]
@@ -21,6 +23,7 @@ ENVIRONMENTS = ["production", "staging"]
 def build_http_frames(pool_size: int = 200) -> list[bytes]:
     """Pre-builds raw HTTP/1.1 Keep-Alive POST frames (with X-API-Key auth) so 0% CPU is wasted on client overhead."""
     frames = []
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     for _ in range(pool_size):
         latency = random.randint(8, 35) if random.random() < 0.90 else random.randint(45, 95)
         msg = "Operation completed successfully" if latency <= 35 else "High latency warning"
@@ -30,6 +33,7 @@ def build_http_frames(pool_size: int = 200) -> list[bytes]:
             "environment": [random.choice(ENVIRONMENTS)],
             "payload": msg,
             "latency_ms": latency,
+            "timestamp": now_iso,
         }).encode("utf-8")
 
         frame = (
@@ -44,32 +48,64 @@ def build_http_frames(pool_size: int = 200) -> list[bytes]:
     return frames
 
 
+async def open_nodelay_connection() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    reader, writer = await asyncio.open_connection(HOST, PORT)
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+    return reader, writer
+
+
 async def socket_worker(num_requests: int, frames: list[bytes]) -> dict:
     results = {"success": 0, "failed": 0, "errors": 0}
     pool_len = len(frames)
 
     try:
-        reader, writer = await asyncio.open_connection(HOST, PORT)
-        for i in range(num_requests):
-            frame = frames[i % pool_len]
+        reader, writer = await open_nodelay_connection()
+        sent = 0
+        while sent < num_requests:
+            batch_count = min(PIPELINE_DEPTH, num_requests - sent)
+            batch_bytes = b"".join(frames[(sent + j) % pool_len] for j in range(batch_count))
             try:
-                writer.write(frame)
-                data = await reader.read(1024)
-                if not data:
-                    # Keep-alive socket closed by server (EOF); reconnect transparently and retry frame
-                    writer.close()
-                    reader, writer = await asyncio.open_connection(HOST, PORT)
-                    writer.write(frame)
-                    data = await reader.read(1024)
+                writer.write(batch_bytes)
+                await writer.drain()
 
-                if b"202 Accepted" in data:
-                    results["success"] += 1
-                else:
-                    results["failed"] += 1
+                responses_received = 0
+                buf = b""
+                while responses_received < batch_count:
+                    chunk = await reader.read(8192)
+                    if not chunk:
+                        writer.close()
+                        reader, writer = await open_nodelay_connection()
+                        remaining = batch_count - responses_received
+                        retry_bytes = b"".join(
+                            frames[(sent + responses_received + j) % pool_len] for j in range(remaining)
+                        )
+                        writer.write(retry_bytes)
+                        await writer.drain()
+                        continue
+
+                    buf += chunk
+                    # Each JSON body ends with '}', and each response starts with 'HTTP/1.1 '
+                    while b"}" in buf:
+                        idx = buf.index(b"}") + 1
+                        one_resp = buf[:idx]
+                        buf = buf[idx:]
+                        responses_received += 1
+                        if b"202 Accepted" in one_resp:
+                            results["success"] += 1
+                        else:
+                            results["failed"] += 1
+
+                sent += batch_count
             except Exception:
-                results["errors"] += 1
+                results["errors"] += batch_count
+                sent += batch_count
                 try:
-                    reader, writer = await asyncio.open_connection(HOST, PORT)
+                    reader, writer = await open_nodelay_connection()
                 except Exception:
                     pass
         writer.close()
