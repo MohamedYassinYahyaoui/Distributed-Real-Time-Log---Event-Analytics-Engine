@@ -150,3 +150,15 @@ def test_analytics_api_redis_cache_hit_and_miss():
         assert resp2.headers["X-Cache"] == "HIT"
         assert res2["total_events"] == 100000
         assert ch_mock.call_count == 1
+
+
+def test_missing_auth_credentials_rejected_401():
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            auth.authenticate_and_ratelimit(
+                x_api_key=None,
+                authorization=None,
+            )
+        )
+    assert exc_info.value.status_code == 401
+    assert "Missing authentication credentials" in exc_info.value.detail

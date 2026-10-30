@@ -97,6 +97,7 @@ services:
       - DATABASE_URL=postgresql+asyncpg://streampulse:streampulse_pass@postgres:5432/streampulse_auth
       - REDIS_URL=redis://redis:6379/0
       - JWT_SECRET_KEY=streampulse-hs256-super-secret-jwt-key-2026
+      - ALLOW_DEFAULT_BENCH_KEY=false
     depends_on:
       postgres:
         condition: service_healthy

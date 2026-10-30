@@ -229,7 +229,7 @@ docker exec stream-pulse-clickhouse clickhouse-client --password admin -q "SELEC
 
 ---
 
-### 4. Automated Unit, Auth, Rate-Limit & Failure-Mode Test Suite (`14 passed`)
+### 4. Automated Unit, Auth, Rate-Limit & Failure-Mode Test Suite (`15 passed`)
 
 ```powershell
 & ".\.venv\Scripts\python.exe" -m pytest tests/test_consumer_worker.py tests/test_auth_and_ratelimit.py -v
@@ -237,24 +237,25 @@ docker exec stream-pulse-clickhouse clickhouse-client --password admin -q "SELEC
 
 ```text
 ============================= test session starts =============================
-collected 14 items
+collected 15 items
 
-tests/test_consumer_worker.py::test_parse_event_valid PASSED                                     [  7%]
-tests/test_consumer_worker.py::test_parse_event_invalid_json PASSED                              [ 14%]
-tests/test_consumer_worker.py::test_flush_to_clickhouse_success PASSED                           [ 21%]
-tests/test_consumer_worker.py::test_flush_to_clickhouse_falls_back_to_dlq_and_returns_true PASSED [ 28%]
-tests/test_consumer_worker.py::test_flush_to_clickhouse_returns_false_when_both_inserts_fail PASSED [ 35%]
-tests/test_consumer_worker.py::test_manual_commit_only_after_successful_flush PASSED             [ 42%]
-tests/test_consumer_worker.py::test_no_offset_commit_when_flush_fails PASSED                     [ 50%]
-tests/test_auth_and_ratelimit.py::test_api_key_generation_and_sha256_hashing PASSED             [ 57%]
-tests/test_auth_and_ratelimit.py::test_jwt_token_creation_and_verification PASSED               [ 64%]
-tests/test_auth_and_ratelimit.py::test_jwt_expired_token_rejected_401 PASSED                     [ 71%]
-tests/test_auth_and_ratelimit.py::test_resolve_api_key_l2_redis_cache_hit PASSED                 [ 78%]
-tests/test_auth_and_ratelimit.py::test_invalidate_api_key_cache_purges_l1_and_redis PASSED       [ 85%]
-tests/test_auth_and_ratelimit.py::test_redis_atomic_rate_limiter_enforces_quota_and_429 PASSED   [ 92%]
-tests/test_auth_and_ratelimit.py::test_analytics_api_redis_cache_hit_and_miss PASSED             [100%]
+tests/test_consumer_worker.py::test_parse_event_valid PASSED                                     [  6%]
+tests/test_consumer_worker.py::test_parse_event_invalid_json PASSED                              [ 13%]
+tests/test_consumer_worker.py::test_flush_to_clickhouse_success PASSED                           [ 20%]
+tests/test_consumer_worker.py::test_flush_to_clickhouse_falls_back_to_dlq_and_returns_true PASSED [ 26%]
+tests/test_consumer_worker.py::test_flush_to_clickhouse_returns_false_when_both_inserts_fail PASSED [ 33%]
+tests/test_consumer_worker.py::test_manual_commit_only_after_successful_flush PASSED             [ 40%]
+tests/test_consumer_worker.py::test_no_offset_commit_when_flush_fails PASSED                     [ 46%]
+tests/test_auth_and_ratelimit.py::test_api_key_generation_and_sha256_hashing PASSED             [ 53%]
+tests/test_auth_and_ratelimit.py::test_jwt_token_creation_and_verification PASSED               [ 60%]
+tests/test_auth_and_ratelimit.py::test_jwt_expired_token_rejected_401 PASSED                     [ 66%]
+tests/test_auth_and_ratelimit.py::test_resolve_api_key_l2_redis_cache_hit PASSED                 [ 73%]
+tests/test_auth_and_ratelimit.py::test_invalidate_api_key_cache_purges_l1_and_redis PASSED       [ 80%]
+tests/test_auth_and_ratelimit.py::test_redis_atomic_rate_limiter_enforces_quota_and_429 PASSED   [ 86%]
+tests/test_auth_and_ratelimit.py::test_analytics_api_redis_cache_hit_and_miss PASSED             [ 93%]
+tests/test_auth_and_ratelimit.py::test_missing_auth_credentials_rejected_401 PASSED             [100%]
 
-============================= 14 passed in 1.01s ==============================
+============================= 15 passed in 1.00s ==============================
 ```
 
 ---

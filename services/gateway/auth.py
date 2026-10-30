@@ -29,9 +29,9 @@ JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "streampulse-hs256-super-secret-jwt
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
 
-# Default benchmark key used when X-API-Key is omitted by local load generator
+# Default benchmark key fallback (disabled by default in production to enforce explicit auth)
 DEFAULT_BENCH_API_KEY = os.getenv("DEFAULT_API_KEY", "sp_live_default_bench_key_2026")
-ALLOW_DEFAULT_BENCH_KEY = os.getenv("ALLOW_DEFAULT_BENCH_KEY", "true").lower() == "true"
+ALLOW_DEFAULT_BENCH_KEY = os.getenv("ALLOW_DEFAULT_BENCH_KEY", "false").lower() == "true"
 
 # Cache TTLs
 L1_CACHE_TTL_SECONDS = 30.0
