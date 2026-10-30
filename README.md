@@ -171,8 +171,8 @@ Throughput:        13075.79 req/sec
 | :--- | :--- | :--- | :--- | :--- |
 | **1. Baseline** | Synchronous per-request broker ACK (`producer.send_and_wait`) | Every HTTP POST waited on an individual network RTT to Redpanda (`50k` events). | `446.58s` (50k) | **111.96 req/sec** |
 | **2. Producer Batching** | Per-message TCP packets between Gateway & Redpanda | Switched to `producer.send()` with `linger_ms=5`, `max_batch_size=64KB`, and `acks=1`. | `51.10s` (50k) | **978.51 req/sec** *(8.7x)* |
-| **3. Multi-Worker ASGI** | Single Uvicorn process (1 CPU core GIL) + stdout access log I/O | Configured `--workers 4 --no-access-log` in Gateway + manual consumer offset commits. | `4.67s` (50k) | **10,201.77 req/sec** *(91x)* |
-| **4. Zero-Copy Load Gen** | Client-side `httpx` object allocation & JSON serialization in hot loop | Multi-process `Pool(4)` + pre-encoded `HTTP/1.1 Keep-Alive` byte frames over raw sockets. | `7.33s` (100k) | **13,075.79 req/sec** *(116x)* |
+| **3. Multi-Worker ASGI** | Single Uvicorn process (1 CPU core GIL) + stdout access log I/O | Configured `--workers 4 --no-access-log` in Gateway + manual consumer offset commits. | `4.90s` (50k) | **10,201.77 req/sec** *(91x)* |
+| **4. Zero-Copy Load Gen** | Client-side `httpx` object allocation & JSON serialization in hot loop | Multi-process `Pool(4)` + pre-encoded `HTTP/1.1 Keep-Alive` byte frames over raw sockets. | `7.65s` (100k) | **13,075.79 req/sec** *(116x)* |
 | **5. Auth & Rate-Limit Plane** | PostgreSQL DB round-trips & Redis atomic lock contention at 10k rps | L1 memory cache (30s) + L2 Redis read-through + batched Redis rate limiter (`RATE_LIMIT_SYNC_BATCH=250`). | `4.70s` (50k) | **10,635.49 req/sec** *(with Auth)* |
 
 > [!NOTE]
