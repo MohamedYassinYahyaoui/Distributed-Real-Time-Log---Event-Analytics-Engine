@@ -123,12 +123,12 @@ stream-pulse-verifier  | === [StreamPulse Verifier] Pipeline Healthy! Grafana Li
 
 ## Benchmarks & Failure Modes
 
-### 1. High-Throughput Load Benchmark (`10,201` to `13,075 req/sec`)
+### 1. High-Throughput Load Benchmark (`10,635` to `13,075 req/sec`)
 
-`load_tests/load_generator.py` bypasses client-side Python GIL and HTTP library overhead by spawning **4 OS processes** (`multiprocessing.Pool`), each driving **25 concurrent `asyncio` raw TCP sockets** (`100` concurrent `HTTP/1.1 Keep-Alive` connections total) with pre-serialized `X-API-Key` authenticated byte frames.
+`load_tests/load_generator.py` drives the ingestion path by spawning **4 OS processes** (`multiprocessing.Pool`), each managing **25 concurrent raw TCP keep-alive sockets** (100 concurrent `HTTP/1.1` connections total) with `TCP_NODELAY`, pre-serialized `X-API-Key` headers, and HTTP/1.1 pipelining (`PIPELINE_DEPTH = 25`).
 
 ```powershell
-# Run 50,000-event benchmark
+# Run 50,000-event benchmark (Full Auth + Rate Limiting Enabled)
 $env:TOTAL_REQUESTS = '50000'
 & ".\.venv\Scripts\python.exe" ".\load_tests\load_generator.py"
 
@@ -137,7 +137,21 @@ $env:TOTAL_REQUESTS = '100000'
 & ".\.venv\Scripts\python.exe" ".\load_tests\load_generator.py"
 ```
 
-#### Actual Terminal Output (`100,000` Events across 100 Concurrent Sockets)
+#### Actual Terminal Output: 50,000 Events with Auth & Rate-Limiting Control Plane
+
+```text
+Starting load test: 50000 events | 4 OS processes | 100 concurrent keep-alive sockets...
+
+--- Load Test Results ---
+Total Events Sent: 50000
+Successful (202):  50000
+Failed (Non-202):  0
+Network Errors:    0
+Elapsed Time:      4.70 seconds
+Throughput:        10635.49 req/sec
+```
+
+#### Actual Terminal Output: 100,000 Events Raw Ingestion Baseline
 
 ```text
 Starting load test: 100000 events | 4 OS processes | 100 concurrent keep-alive sockets...
@@ -159,6 +173,12 @@ Throughput:        13075.79 req/sec
 | **2. Producer Batching** | Per-message TCP packets between Gateway & Redpanda | Switched to `producer.send()` with `linger_ms=5`, `max_batch_size=64KB`, and `acks=1`. | `51.10s` (50k) | **978.51 req/sec** *(8.7x)* |
 | **3. Multi-Worker ASGI** | Single Uvicorn process (1 CPU core GIL) + stdout access log I/O | Configured `--workers 4 --no-access-log` in Gateway + manual consumer offset commits. | `4.67s` (50k) | **10,201.77 req/sec** *(91x)* |
 | **4. Zero-Copy Load Gen** | Client-side `httpx` object allocation & JSON serialization in hot loop | Multi-process `Pool(4)` + pre-encoded `HTTP/1.1 Keep-Alive` byte frames over raw sockets. | `7.33s` (100k) | **13,075.79 req/sec** *(116x)* |
+| **5. Auth & Rate-Limit Plane** | PostgreSQL DB round-trips & Redis atomic lock contention at 10k rps | L1 memory cache (30s) + L2 Redis read-through + batched Redis rate limiter (`RATE_LIMIT_SYNC_BATCH=250`). | `4.70s` (50k) | **10,635.49 req/sec** *(with Auth)* |
+
+> [!NOTE]
+> **Benchmark Methodology & Realistic Constraints:**
+> - Measured locally on Windows 11 / AMD 16-core host over localhost loopback network.
+> - Uses HTTP/1.1 pipelining (`PIPELINE_DEPTH = 25`), which mirrors high-throughput batching agents, telemetry collectors, and forwarder daemons (like FluentBit or Vector). Standard non-pipelined web browsers will be bounded by round-trip network latency.
 
 ---
 
