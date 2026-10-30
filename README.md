@@ -161,7 +161,7 @@ Total Events Sent: 100000
 Successful (202):  100000
 Failed (Non-202):  0
 Network Errors:    0
-Elapsed Time:      7.33 seconds
+Elapsed Time:      7.65 seconds
 Throughput:        13075.79 req/sec
 ```
 
